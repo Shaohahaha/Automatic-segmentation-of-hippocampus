@@ -3,16 +3,51 @@ import argparse
 import glob
 import os
 import random
+import hausdorff
 import numpy as np
 import torch
+import datetime
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import transforms
 from torch.utils.data import Dataset,DataLoader
 from torch.utils.data import random_split
 
+def create_dir_not_exist(path):
+    if not os.path.exists(path):
+        os.mkdir(path)
+
+def transform_image_data(predict: np.ndarray, label: np.ndarray):
+    predict = predict.astype(np.bool_).astype(np.int_)
+    label = label.astype(np.bool_).astype(np.int_)
+    return predict, label
+
+def dice_coef(predict: np.ndarray, label: np.ndarray, epsilon: float = 1e-5) -> float:
+    predict, label = transform_image_data(predict, label)
+    intersection = (predict * label).sum()
+    return (2. * intersection + epsilon) / (predict.sum() + label.sum() + epsilon)
+
+def ppv_compute(predict: np.ndarray, label: np.ndarray, epsilon: float = 1e-5) -> float:
+    predict, label = transform_image_data(predict, label)
+    intersection = (predict * label).sum()
+    return (intersection + epsilon) / (predict.sum() + epsilon)
+
+def hd95_compute(predict: np.ndarray, label: np.ndarray, distance="euclidean"):
+    predict, label = transform_image_data(predict, label)
+    predict = predict.flatten()[..., None]
+    label = label.flatten()[..., None]
+    distance = hausdorff.hausdorff_distance(predict, label, distance=distance)
+    return distance * 0.95
+
+def jaccard_compute(predict: np.ndarray, label: np.ndarray):
+    predict, label = transform_image_data(predict, label)
+    intersection = np.intersect1d(predict,label)
+    union = np.union1d(predict, label)
+    jaccard_similarity = intersection.size / union.size
+    return jaccard_similarity
+
 class MRIDataset(Dataset):
-    def __init__(self, url,W,H, transform=None):
+    def __init__(self, url, W, H, transform=None):
         self.label = glob.glob(os.path.join(url, 'label_combine/*/*/*.jpg'))
         self.transform = transform
         self.W = W
@@ -184,7 +219,10 @@ def merge_labels_and_save(base_path, subject, output_path):
             os.makedirs(output_folder, exist_ok=True)
 
             # 保存文件名保持原始文件名结构
-            output_image_name = os.path.basename(left_labels[idx])
+            if(label_folder_path[-4:]=='ACPC'):
+                output_image_name = os.path.basename(left_labels[idx].replace('L','ACPC'))
+            else:
+                output_image_name = os.path.basename(left_labels[idx].replace('L', 'tal_noscale'))
             output_image_path = os.path.join(output_folder, output_image_name)
             cv2.imwrite(output_image_path, combined_label)
 
@@ -194,9 +232,9 @@ def merge_labels_and_save(base_path, subject, output_path):
 
     # cv2.destroyAllWindows()
 
-def load_data(url="./dataset", W=240, H=320, batch_size=4, shuffle=True, split=None):
+def load_data(url="./dataset", W=240, H=320, batch_size=64, shuffle=True, split=None):
     # 实例化自定义Dataset，加载数据集
-    mri = MRIDataset(url,W,H, transform=transforms.Compose([
+    mri = MRIDataset(url, W, H, transform=transforms.Compose([
         transforms.ToTensor()
     ]))
     # 分割数据集
@@ -211,46 +249,63 @@ def load_data(url="./dataset", W=240, H=320, batch_size=4, shuffle=True, split=N
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=shuffle)
     return train_loader, test_loader
 
-def train(loader, lr=1e-3, epochs=10, model="model/model.pth", record="model/record.txt",device="cpu"):
+def train(loader, device="cpu",batch_size=16, lr=1e-3, epochs=10, model="model/"):
     assert(isinstance(loader, DataLoader))
+    current_time = datetime.datetime.now()
+    formatted_time = current_time.strftime("%Y_%m_%d_%H_%M_%S")
     net = UNet(1, 1) # 实例化网络
     net = net.to(device)
-    optimizer = optim.Adam(net.parameters(), lr=lr) # 优化器
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr) # 优化器
     criterion = nn.BCELoss() # 损失函数
-    if not os.path.exists('model'):
-        os.makedirs('model')
-    record = open(record, "w")
+    model_savepath = model+'/' + formatted_time + '/'
+    create_dir_not_exist(model_savepath)
+    record = open(model_savepath+'record.txt', "a")
+    record.write('tringing_'+ formatted_time + "\n")
     # 开始训练
     for epoch in range(epochs):
         net.train()
         batch_id = 1
         total_batch = len(loader)
         for image, label in loader:
-            logit = net(image)
-            loss = criterion(logit, label.float()) # 计算损失
+            logit = net(image.to(device))
+            loss = criterion(logit, label.float().to(device)) # 计算损失
+            #计算指标
+            np_logit = np.asarray(logit.cpu().detach)
+            np_label = np.asarray(label)
+            dice = dice_coef(np_logit,np_label)
+            ppv = ppv_compute(np_logit,np_label)
+            jaccard = jaccard_compute(np_logit,np_label)
+            hd95 = hd95_compute(np_logit,np_label)
             # 更新模型参数
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            if batch_id % 4 == 0:
-                r = "[Epoch: {}/{}][Batch: {}/{}][Loss: {}]"\
-                    .format(epoch + 1, epochs, batch_id, total_batch, loss.item())
+            if batch_id % batch_size  == 0:
+                r = "[Epoch: {}/{}][Batch: {}/{}][Loss: {}][Dice: {}][jaccard: {}][ppv: {}][hd95: {}]"\
+                    .format(epoch + 1, epochs, batch_id, total_batch, loss.item(),dice,jaccard,ppv,hd95)
                 print(r)
                 record.write(r + "\n")
             batch_id += 1
-    record.write("[Training Finished]")
+        torch.save(net.state_dict(), model_savepath + 'train_' + str(epoch) + '.pth')
+    record.write("[Training Finished]"+ "\n")
     # 存储网络参数
-    torch.save(net.state_dict(), model)
 
-def predict(loader, model="model/model.pth", pred_dir="dataset/data/pred",device="cpu"):
+
+def predict(loader, model="model/model.pth", pred_dir="/pred",device="cpu",record_pred="./model/record_pred.txt"):
     assert (isinstance(loader, DataLoader))
     # 初始化网络并加载权重
     net = UNet(1, 1)
     net = net.to(device)
     net.load_state_dict(torch.load(model))
     net.eval()
+    #预测值归0
+    total_dice = 0
+    total_jaccard = 0
+    total_ppv = 0
+    total_hd95 =0
     # 预测
     order = 1
+    record_pred = open(record_pred, "w")
     for image, label in loader:
         pred = net(image)
         for i, p in zip(image.detach().numpy(), pred.detach().numpy()):
@@ -262,8 +317,23 @@ def predict(loader, model="model/model.pth", pred_dir="dataset/data/pred",device
             cv2.imwrite("{}/{}.jpg".format(pred_dir, order), i * 255)
             cv2.imwrite("{}/{}_L.jpg".format(pred_dir, order), p * 255)
             order += 1
-
-
+        # 计算指标
+        np_pred = np.asarray(pred.cpu())
+        np_label = np.asarray(label)
+        dice = dice_coef(np_pred, np_label)
+        ppv = ppv_compute(np_pred, np_label)
+        jaccard = jaccard_compute(np_pred, np_label)
+        hd95 = hd95_compute(np_pred, np_label)
+        r = "[order:{}][Dice: {}][jaccard: {}][ppv: {}][hd95: {}]" \
+            .format(order,dice, jaccard, ppv, hd95)
+        print(r)
+        total_dice = total_dice+dice
+        total_ppv = total_ppv+ppv
+        total_jaccard = total_jaccard+jaccard
+        total_hd95 = total_hd95+hd95
+    r = "[Dice: {}][jaccard: {}][ppv: {}][hd95: {}]" \
+        .format(total_dice/order, total_jaccard/order, total_ppv/order, total_hd95/order)
+    record_pred.write(r + "\n")
 
 def main():
     # Parse command line arguments.
@@ -272,15 +342,24 @@ def main():
                         help='数据集真值合并预处理根目录')
     parser.add_argument('--output_path', type=str, default='./dataset/MRI_Hippocampus_Segmentation/label_combine',
                         help='数据集真值合并预处理输出目录')
-    parser.add_argument('--data_preprocess', default=True,
-                        help='是否进行数据集真值合并预处理')
+    parser.add_argument('--data_preprocess', default=False,
+                        help='是否进行数据集真值合并预处理(default: True)')
     parser.add_argument('--model_path', type=str,
-                        default='./model/model.pth',
+                        default='./model',
                         help='预训练模型路径')
-    parser.add_argument('--H', type=int, default=320,
-                        help='resize后图片的高')
-    parser.add_argument('--W', type=int, default=240,
-                        help='resize后图片的宽')
+    parser.add_argument('--pred_path', type=str,
+                        default='./pred',
+                        help='测试结果输出路径')
+    parser.add_argument('--H', type=int, default=160,
+                        help='resize后图片的高(default: 160)')
+    parser.add_argument('--W', type=int, default=120,
+                        help='resize后图片的宽(default: 120)')
+    parser.add_argument('--batch_size', type=int, default=4,
+                        help='barch_size大小(default:16)')
+    parser.add_argument('--lr', type=int, default=1e-3,
+                        help='训练时学习率(default:1e-3)')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='epoch大小(default:100)')
     parser.add_argument('--cuda', default=True, action='store_true',
                         help='是否使用GPU加速网络(default: False)')
     parser.add_argument('--no_display', default=False, action='store_true',
@@ -292,28 +371,26 @@ def main():
     opt = parser.parse_args()
     print(opt)
 
+    # 数据预处理
     if(opt.data_preprocess):
-        # 数据预处理
-        base_path = './dataset/MRI_Hippocampus_Segmentation'
-        output_path = './dataset/MRI_Hippocampus_Segmentation/label_combine'  # 将左右海马体真值合并成一张图片
-
         # 可以根据需要选择不同的subject进行处理
         subjects = ['35', '100']  # 例如，处理'35'和'100'
 
         for subject in subjects:
-            merge_labels_and_save(base_path, subject, output_path)
+            merge_labels_and_save(opt.base_path, subject, opt.output_path)
 
     # 加载数据集
-    # train_loader, test_loader = load_data(base_path,opt.W,opt.H)
+    train_loader, test_loader = load_data(opt.base_path,opt.W,opt.H,opt.batch_size)
 
     if(opt.cuda):
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        print("目前使用的为："+ device)
-    # #训练
-    # train(train_loader,device)
-
+    else:
+        device = torch.device("cpu")
+    print("目前使用的为：" + str(device))
+    #训练
+    train(train_loader,device,opt.batch_size,opt.lr,opt.epochs,opt.model_path)
     # 预测
-    # predict(test_loader,device)
+    # predict(test_loader,device,opt.pred_dir)
 
 if __name__ == "__main__":
     main()
