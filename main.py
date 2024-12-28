@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import datetime
 import torch.nn as nn
-import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from torch.utils.data import Dataset,DataLoader
 from torch.utils.data import random_split
@@ -34,10 +34,18 @@ def ppv_compute(predict: np.ndarray, label: np.ndarray, epsilon: float = 1e-5) -
 
 def hd95_compute(predict: np.ndarray, label: np.ndarray, distance="euclidean"):
     predict, label = transform_image_data(predict, label)
-    predict = predict.flatten()[..., None]
-    label = label.flatten()[..., None]
-    distance = hausdorff.hausdorff_distance(predict, label, distance=distance)
-    return distance * 0.95
+    hd95_values = 0
+    for i in range(predict.shape[0]):  # 遍历每个图像
+        predict_t = predict[i].squeeze(0)
+        label_t = label[i].squeeze(0)
+
+        # 计算 Hausdorff 距离
+        distance_value = hausdorff.hausdorff_distance(predict_t, label_t, distance=distance)
+
+        # 计算 95% Hausdorff 距离
+        hd95_values += distance_value * 0.95
+
+    return hd95_values
 
 def jaccard_compute(predict: np.ndarray, label: np.ndarray):
     predict, label = transform_image_data(predict, label)
@@ -253,6 +261,7 @@ def train(loader, device="cpu",batch_size=16, lr=1e-3, epochs=10, model="model/"
     assert(isinstance(loader, DataLoader))
     current_time = datetime.datetime.now()
     formatted_time = current_time.strftime("%Y_%m_%d_%H_%M_%S")
+    writer = SummaryWriter(log_dir='runs/train_'+formatted_time)
     net = UNet(1, 1) # 实例化网络
     net = net.to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=lr) # 优化器
@@ -265,28 +274,59 @@ def train(loader, device="cpu",batch_size=16, lr=1e-3, epochs=10, model="model/"
     for epoch in range(epochs):
         net.train()
         batch_id = 1
+        train_num = 0
         total_batch = len(loader)
+        total_loss = 0
+        total_dice = 0
+        total_ppv = 0
+        total_jaccard = 0
+        total_hd95 = 0
         for image, label in loader:
+            image = image/255 #输入归一化
             logit = net(image.to(device))
-            loss = criterion(logit, label.float().to(device)) # 计算损失
             #计算指标
-            np_logit = np.asarray(logit.cpu().detach)
-            np_label = np.asarray(label)
+            np_logit = logit.cpu().detach().numpy()
+            np_label = label.numpy()
             dice = dice_coef(np_logit,np_label)
             ppv = ppv_compute(np_logit,np_label)
             jaccard = jaccard_compute(np_logit,np_label)
             hd95 = hd95_compute(np_logit,np_label)
             # 更新模型参数
+            loss_bce = criterion(logit, label.float().to(device))  # 计算损失
+            loss_dice = 1 - dice
+            loss = (loss_bce + loss_dice) / 2
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            if batch_id % batch_size  == 0:
-                r = "[Epoch: {}/{}][Batch: {}/{}][Loss: {}][Dice: {}][jaccard: {}][ppv: {}][hd95: {}]"\
-                    .format(epoch + 1, epochs, batch_id, total_batch, loss.item(),dice,jaccard,ppv,hd95)
-                print(r)
-                record.write(r + "\n")
-            batch_id += 1
+
+            # 记录每个batch的损失和指标
+            total_loss += loss.item()
+            total_dice += dice
+            total_ppv += ppv
+            total_jaccard += jaccard
+            total_hd95 += hd95
+
+            # if batch_id % batch_size  == 0:
+            #     r = "[Epoch: {}/{}][Batch: {}/{}][Loss: {}][Dice: {}][jaccard: {}][ppv: {}][hd95: {}]"\
+            #         .format(epoch + 1, epochs, batch_id, total_batch, loss.item(),dice,jaccard,ppv,hd95)
+            #     # print(r)
+            #     record.write(r + "\n")
+
+            # TensorBoard记录
+            writer.add_scalar('Loss/train', loss.item(), train_num)
+            writer.add_scalar('Dice/train', dice, train_num)
+            writer.add_scalar('Jaccard/train', jaccard, train_num)
+            writer.add_scalar('PPV/train', ppv, train_num)
+            writer.add_scalar('HD95/train', hd95, train_num)
+            writer.add_images('Input Images', image * 255, train_num)
+            writer.add_images('Output Images', logit * 255, train_num)
+            writer.add_images('Label', label * 255, train_num)
+
+            train_num += 1
+
         torch.save(net.state_dict(), model_savepath + 'train_' + str(epoch) + '.pth')
+    writer.close()
     record.write("[Training Finished]"+ "\n")
     # 存储网络参数
 
@@ -350,14 +390,14 @@ def main():
     parser.add_argument('--pred_path', type=str,
                         default='./pred',
                         help='测试结果输出路径')
-    parser.add_argument('--H', type=int, default=160,
-                        help='resize后图片的高(default: 160)')
-    parser.add_argument('--W', type=int, default=120,
-                        help='resize后图片的宽(default: 120)')
+    parser.add_argument('--H', type=int, default=320,
+                        help='resize后图片的高(default: 320)')
+    parser.add_argument('--W', type=int, default=240,
+                        help='resize后图片的宽(default: 240)')
     parser.add_argument('--batch_size', type=int, default=4,
-                        help='barch_size大小(default:16)')
-    parser.add_argument('--lr', type=int, default=1e-3,
-                        help='训练时学习率(default:1e-3)')
+                        help='barch_size大小(default:4)')
+    parser.add_argument('--lr', type=int, default=1e-2,
+                        help='训练时学习率(default:1e-4)')
     parser.add_argument('--epochs', type=int, default=100,
                         help='epoch大小(default:100)')
     parser.add_argument('--cuda', default=True, action='store_true',
