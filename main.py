@@ -89,6 +89,17 @@ def jaccard_compute(predict: np.ndarray, label: np.ndarray):
     jaccard_similarity = intersection.size / union.size
     return jaccard_similarity
 
+class DiceLoss(nn.Module):
+    def __init__(self, epsilon=1e-5):
+        super(DiceLoss, self).__init__()
+        self.epsilon = epsilon
+
+    def forward(self, predict, target):
+        intersection = torch.sum(predict * target)
+        union = torch.sum(predict) + torch.sum(target)
+        return 1 - (2. * intersection + self.epsilon) / (union + self.epsilon)
+
+
 class MRIDataset(Dataset):
     def __init__(self, url, W, H, transform=None):
         self.label = glob.glob(os.path.join(url, 'label_combine/*/*/*.jpg'))
@@ -297,7 +308,7 @@ def load_data(url="./dataset", W=240, H=320, batch_size=64, shuffle=True, split=
 
     return train_loader, test_loader
 
-def train(loader, device="cpu",batch_size=4, lr=1e-3, epochs=10, model="model/"):
+def train(loader, device="cpu",batch_size=4, lr=1e-3, epochs=10, model="model/",threshold = 0.5):
     assert(isinstance(loader, DataLoader))
     current_time = datetime.datetime.now()
     formatted_time = current_time.strftime("%Y_%m_%d_%H_%M_%S")
@@ -323,24 +334,29 @@ def train(loader, device="cpu",batch_size=4, lr=1e-3, epochs=10, model="model/")
         total_jaccard = 0
         total_hd95 = 0
         for image, label in loader:
-            image = image/255 #输入归一化
+            image = image/255.0 #输入归一化
             logit = net(image.to(device))
-            #计算指标
-            np_logit = logit.cpu().detach().numpy()
-            np_label = label.numpy()
-            dice = dice_coef(np_logit,np_label)
-            ppv = ppv_compute(np_logit,np_label)
-            jaccard = jaccard_compute(np_logit,np_label)
-            hd95 = hd95_compute(np_logit,np_label)
             # 更新模型参数
             loss_bce = criterion(logit, label.float().to(device))  # 计算损失
-            loss_dice = 1 - dice
+            dice_loss = DiceLoss()
+            loss_dice = dice_loss(logit, label.float().to(device))
             loss = (loss_bce + loss_dice) / 2
+            # loss = loss_dice
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
+            # 阈值分割
+            binarized_logit = torch.where(logit < threshold, torch.tensor(0.0, device=logit.device), logit)
+            binarized_logit = torch.where(binarized_logit< threshold, torch.tensor(1.0, device=binarized_logit.device), binarized_logit)
+            # 计算指标
+            np_logit = binarized_logit.cpu().detach().numpy()
+            np_label = label.numpy()
+            dice = dice_coef(np_logit, np_label)
+            ppv = ppv_compute(np_logit, np_label)
+            jaccard = jaccard_compute(np_logit, np_label)
+            hd95 = hd95_compute(np_logit, np_label)
             # 记录每个batch的损失和指标
             total_loss += loss.item()
             total_dice += dice
@@ -365,7 +381,7 @@ def train(loader, device="cpu",batch_size=4, lr=1e-3, epochs=10, model="model/")
             writer.add_scalar('PPV/train', ppv, train_num)
             writer.add_scalar('HD95/train', hd95, train_num)
             writer.add_images('Input Images', image * 255, train_num)
-            writer.add_images('Output Images', logit * 255, train_num)
+            writer.add_images('Output Images', np_logit * 255, train_num)
             writer.add_images('Label', label * 255, train_num)
 
             train_num += 1
@@ -441,10 +457,12 @@ def main():
                         help='resize后图片的宽(default: 240)')
     parser.add_argument('--batch_size', type=int, default=4,
                         help='barch_size大小(default:4)')
-    parser.add_argument('--lr', type=int, default=1e-4,
+    parser.add_argument('--lr', type=int, default=1e-3,
                         help='训练时学习率(default:1e-4)')
     parser.add_argument('--epochs', type=int, default=100,
                         help='epoch大小(default:100)')
+    parser.add_argument('--threshold', type=float, default=0.5,
+                        help='阈值threshold大小(default:0.5)，大于此值才判断为海马体区域')
     parser.add_argument('--cuda', default=True, action='store_true',
                         help='是否使用GPU加速网络(default: False)')
     parser.add_argument('--no_display', default=False, action='store_true',
@@ -474,7 +492,7 @@ def main():
         device = torch.device("cpu")
 
     #训练
-    train(train_loader,device,opt.batch_size,opt.lr,opt.epochs,opt.model_path)
+    train(train_loader,device,opt.batch_size,opt.lr,opt.epochs,opt.model_path,opt.threshold)
     # 预测
     # predict(test_loader,device,opt.pred_dir)
 
