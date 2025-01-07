@@ -3,11 +3,11 @@ import argparse
 import glob
 import os
 import random
-import hausdorff
 import numpy as np
 import torch
 import datetime
 import torch.nn as nn
+from scipy.spatial.distance import cdist
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from torch.utils.data import Dataset,DataLoader
@@ -32,20 +32,55 @@ def ppv_compute(predict: np.ndarray, label: np.ndarray, epsilon: float = 1e-5) -
     intersection = (predict * label).sum()
     return (intersection + epsilon) / (predict.sum() + epsilon)
 
+def binary_to_point_set(binary_img):
+    """
+    将二值图像转换为点集（坐标列表）
+    :param binary_img: 二值图像，非零点将被视为目标点
+    :return: 点集 (list of tuples)
+    """
+    points = np.argwhere(binary_img > 0)  # 返回非零点的坐标
+    return np.array(points)
+
+
+
 def hd95_compute(predict: np.ndarray, label: np.ndarray, distance="euclidean"):
-    predict, label = transform_image_data(predict, label)
-    hd95_values = 0
-    for i in range(predict.shape[0]):  # 遍历每个图像
-        predict_t = predict[i].squeeze(0)
-        label_t = label[i].squeeze(0)
+    """
+    计算 HD95 距离
+    :param predict: 预测的二值图像数组 (N, H, W)
+    :param label: 真值的二值图像数组 (N, H, W)
+    :param distance: 距离度量方法
+    :return: 平均 HD95 距离 (整数)
+    """
+    total_hd95 = 0
+    invalid_cases = 0
 
-        # 计算 Hausdorff 距离
-        distance_value = hausdorff.hausdorff_distance(predict_t, label_t, distance=distance)
+    for i in range(predict.shape[0]):  # 遍历每张图像
+        predict_img = predict[i]
+        label_img = label[i]
 
-        # 计算 95% Hausdorff 距离
-        hd95_values += distance_value * 0.95
+        predict_img, label_img = transform_image_data(predict_img, label_img)
 
-    return hd95_values
+        predict_points = binary_to_point_set(predict_img)
+        label_points = binary_to_point_set(label_img)
+
+        if predict_points.size == 0 or label_points.size == 0:
+            # 如果任一图像为空集，增加无效计数
+            invalid_cases += 1
+            continue
+
+        # 计算点到点的距离矩阵
+        distances = cdist(predict_points, label_points, metric='euclidean')
+
+        # 计算 HD95 距离
+        hd95 = np.percentile(distances, 95)
+
+        total_hd95 += hd95
+
+    if invalid_cases == predict.shape[0]:
+        return 1000000
+
+    return int(total_hd95 / (predict.shape[0] - invalid_cases))
+
 
 def jaccard_compute(predict: np.ndarray, label: np.ndarray):
     predict, label = transform_image_data(predict, label)
@@ -62,11 +97,10 @@ class MRIDataset(Dataset):
         self.H = H
 
     def augment(self, img, flip):
-        # flip = 1: 水平翻转
-        # flip = 0: 垂直翻转
-        # flip = -1: 同时进行水平翻转和垂直翻转
-        img_flipped = cv2.flip(img, flip)
-        return img_flipped
+        if flip in [-1, 0, 1]:
+            img_flipped = cv2.flip(img, flip)
+            return img_flipped
+        return img
 
     def __getitem__(self, index):
         # 通过索引获取原图和标签的URL
@@ -82,8 +116,7 @@ class MRIDataset(Dataset):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         label = cv2.cvtColor(label, cv2.COLOR_BGR2GRAY)
         # 修正标签，将海马体部分像素设置为1，非海马体部分设置为0
-        if label.max() > 1:
-            label = label / 255
+        label = label / 255
         label[label >= 0.5] = 1
         label[label < 0.5] = 0
         # 进行随机的数据增强
@@ -177,41 +210,40 @@ class UNet(nn.Module):
         R4 = self.U4(R3, L1)
         return self.out(R4)
 
-def merge_labels_and_save(base_path, subject, output_path):
+def filter_non_zero_samples(base_path, subject, output_path):
     """
-    合并左右标签并保存结果
+    筛选并保存真值不为0的样本
 
     :param base_path: 数据集根目录
-    :param subject: 具体的子文件夹（如'35'）
+    :param subject: 数据集子文件夹（如'100'）
     :param output_path: 输出保存路径
     """
-    original_path = os.path.join(base_path, 'original', subject)
     label_path = os.path.join(base_path, 'label', f'{subject}label')
 
-    # 获取original文件夹中的所有子文件夹
-    folders = os.listdir(original_path)
+    # 获取label文件夹中的所有子文件夹
+    folders = os.listdir(label_path)
 
     # 遍历每个子文件夹
     for folder in folders:
         label_folder_path = os.path.join(label_path, folder)
-        left_label_folder = os.path.join(label_folder_path, folder.replace('tal_noscale','L').replace('ACPC','L'))
-        right_label_folder = os.path.join(label_folder_path, folder.replace('tal_noscale','R').replace('ACPC','R'))
+        left_label_folder = os.path.join(label_folder_path, folder.replace('tal_noscale', 'L').replace('ACPC', 'L'))
+        right_label_folder = os.path.join(label_folder_path, folder.replace('tal_noscale', 'R').replace('ACPC', 'R'))
 
         # 检查是否同时存在L和R文件夹
         if not os.path.exists(left_label_folder) or not os.path.exists(right_label_folder):
             print(f"Missing L or R folder in {folder}. Skipping folder.")
             continue
 
-        # 获取原始图像（假设图像是jpg格式）
+        # 获取标签图像（假设图像是jpg格式）
         left_labels = sorted([img for img in os.listdir(left_label_folder) if img.endswith('.jpg')])
         right_labels = sorted([img for img in os.listdir(right_label_folder) if img.endswith('.jpg')])
 
         # 确保每个文件夹中的图像数量一致
         if len(left_labels) != len(right_labels):
-            print(f"Image count mismatch in {folder}. Skipping folder.")
+            print(f"Label count mismatch in {folder}. Skipping folder.")
             continue
 
-        # 遍历每个图像
+        # 遍历每个标签图像
         for idx in range(len(left_labels)):
             left_label_path = os.path.join(left_label_folder, left_labels[idx])
             left_label = cv2.imread(left_label_path, cv2.IMREAD_GRAYSCALE)
@@ -219,23 +251,33 @@ def merge_labels_and_save(base_path, subject, output_path):
             right_label_path = os.path.join(right_label_folder, right_labels[idx])
             right_label = cv2.imread(right_label_path, cv2.IMREAD_GRAYSCALE)
 
-            # 合并左右标签(值相加）
+            # 确保标签尺寸一致
+            if left_label.shape != right_label.shape:
+                print(f"Label size mismatch for {left_labels[idx]} and {right_labels[idx]} in {folder}. Skipping.")
+                continue
+
+            # 标签值相加
             combined_label = cv2.add(left_label, right_label)  # 标签值相加
+
+            # 如果真值最大值小于50，则跳过
+            if np.max(combined_label)<50:
+                # print(f"Combined label {left_labels[idx]} in {folder} is all zeros. Skipping.")
+                continue
 
             # 输出路径
             output_folder = os.path.join(output_path, subject, folder)
             os.makedirs(output_folder, exist_ok=True)
 
             # 保存文件名保持原始文件名结构
-            if(label_folder_path[-4:]=='ACPC'):
-                output_image_name = os.path.basename(left_labels[idx].replace('L','ACPC'))
+            if (label_folder_path[-4:] == 'ACPC'):
+                output_image_name = os.path.basename(left_labels[idx].replace('L', 'ACPC'))
             else:
                 output_image_name = os.path.basename(left_labels[idx].replace('L', 'tal_noscale'))
             output_image_path = os.path.join(output_folder, output_image_name)
             cv2.imwrite(output_image_path, combined_label)
 
             # 可视化或调试（可选）
-            # cv2.imshow(f"Combined Image {folder} - {idx}", combined_image)
+            # cv2.imshow(f"Filtered Label {folder} - {idx}", combined_label)
             # cv2.waitKey(0)
 
     # cv2.destroyAllWindows()
@@ -243,21 +285,19 @@ def merge_labels_and_save(base_path, subject, output_path):
 def load_data(url="./dataset", W=240, H=320, batch_size=64, shuffle=True, split=None):
     # 实例化自定义Dataset，加载数据集
     mri = MRIDataset(url, W, H, transform=transforms.Compose([
-        transforms.ToTensor()
+        transforms.ToTensor()  # 转换为张量
     ]))
     # 分割数据集
-    if split is None:
-        split = [0.7, 0.3]
-    n_total = len(mri)
-    n_train = int(split[0] * n_total)
-    n_test = n_total - n_train
-    train_set, test_set = random_split(mri, [n_train, n_test])
+    split = split or [0.7, 0.3]
+    n_train = int(split[0] * len(mri))
+    train_set, test_set = random_split(mri, [n_train, len(mri) - n_train])
     # 将数据集封装入DataLoader
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=shuffle)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=shuffle)
+    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
+
     return train_loader, test_loader
 
-def train(loader, device="cpu",batch_size=16, lr=1e-3, epochs=10, model="model/"):
+def train(loader, device="cpu",batch_size=4, lr=1e-3, epochs=10, model="model/"):
     assert(isinstance(loader, DataLoader))
     current_time = datetime.datetime.now()
     formatted_time = current_time.strftime("%Y_%m_%d_%H_%M_%S")
@@ -270,11 +310,12 @@ def train(loader, device="cpu",batch_size=16, lr=1e-3, epochs=10, model="model/"
     create_dir_not_exist(model_savepath)
     record = open(model_savepath+'record.txt', "a")
     record.write('tringing_'+ formatted_time + "\n")
+    print("目前使用的为：" + str(device))
     # 开始训练
+    train_num = 0
     for epoch in range(epochs):
         net.train()
         batch_id = 1
-        train_num = 0
         total_batch = len(loader)
         total_loss = 0
         total_dice = 0
@@ -313,6 +354,10 @@ def train(loader, device="cpu",batch_size=16, lr=1e-3, epochs=10, model="model/"
             #     # print(r)
             #     record.write(r + "\n")
 
+            r = "[step: {}][Loss: {}][Dice: {}][jaccard: {}][ppv: {}][hd95: {}]" \
+                         .format(train_num, loss.item(),dice,jaccard,ppv,hd95)
+            record.write(r + "\n")
+
             # TensorBoard记录
             writer.add_scalar('Loss/train', loss.item(), train_num)
             writer.add_scalar('Dice/train', dice, train_num)
@@ -324,8 +369,8 @@ def train(loader, device="cpu",batch_size=16, lr=1e-3, epochs=10, model="model/"
             writer.add_images('Label', label * 255, train_num)
 
             train_num += 1
-
-        torch.save(net.state_dict(), model_savepath + 'train_' + str(epoch) + '.pth')
+            if train_num % 100 == 0:
+                torch.save(net.state_dict(), model_savepath + 'train_' + str(train_num) + 'echo.pth')
     writer.close()
     record.write("[Training Finished]"+ "\n")
     # 存储网络参数
@@ -396,7 +441,7 @@ def main():
                         help='resize后图片的宽(default: 240)')
     parser.add_argument('--batch_size', type=int, default=4,
                         help='barch_size大小(default:4)')
-    parser.add_argument('--lr', type=int, default=1e-2,
+    parser.add_argument('--lr', type=int, default=1e-4,
                         help='训练时学习率(default:1e-4)')
     parser.add_argument('--epochs', type=int, default=100,
                         help='epoch大小(default:100)')
@@ -413,11 +458,12 @@ def main():
 
     # 数据预处理
     if(opt.data_preprocess):
-        # 可以根据需要选择不同的subject进行处理
-        subjects = ['35', '100']  # 例如，处理'35'和'100'
 
-        for subject in subjects:
-            merge_labels_and_save(opt.base_path, subject, opt.output_path)
+        # 使用100作为训练集
+        filter_non_zero_samples(opt.base_path, '100', opt.output_path)
+
+        # 使用35作为测试集（无需过滤）
+        label_path = os.path.join(opt.base_path, 'label', '35label')
 
     # 加载数据集
     train_loader, test_loader = load_data(opt.base_path,opt.W,opt.H,opt.batch_size)
@@ -426,7 +472,7 @@ def main():
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device("cpu")
-    print("目前使用的为：" + str(device))
+
     #训练
     train(train_loader,device,opt.batch_size,opt.lr,opt.epochs,opt.model_path)
     # 预测
