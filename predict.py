@@ -1,0 +1,212 @@
+import cv2
+import argparse
+import glob
+import random
+from torch.utils.data import Dataset,DataLoader
+from torchvision import transforms
+from U_net_tools import *
+
+
+class MRIDataset(Dataset):
+    def __init__(self, url, W, H, transform=None):
+        self.label = glob.glob(os.path.join(url, 'label_combine_pred/*/*/*.jpg'))
+        self.transform = transform
+        self.W = W
+        self.H = H
+
+    def __getitem__(self, index):
+        # 通过索引获取原图和标签的URL
+        label_url = self.label[index]
+        img_url = label_url.replace("label_combine_pred","original")
+        # 通过cv2库读取图像
+        image = cv2.imread(img_url)
+        label = cv2.imread(label_url)
+        #尺寸统一
+        image = cv2.resize(image, (self.W,self.H), interpolation=cv2.INTER_AREA)
+        label = cv2.resize(label, (self.W,self.H), interpolation=cv2.INTER_AREA)
+        # 转换为灰度图，3通道转换为1通道
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        label = cv2.cvtColor(label, cv2.COLOR_BGR2GRAY)
+        # 修正标签，将海马体部分像素设置为1，非海马体部分设置为0
+        label = label / 255
+        label[label >= 0.5] = 1
+        label[label < 0.5] = 0
+        # 转换数据
+        if self.transform:
+            image = self.transform(image)
+            label = self.transform(label)
+        return image, label
+
+    def __len__(self):
+        return len(self.label)
+
+def load_data(url="./dataset", W=240, H=320, batch_size=4, shuffle=True, split=None):
+    # 实例化自定义Dataset，加载训练数据集
+    mri = MRIDataset(url, W, H, transform=transforms.Compose([
+        transforms.ToTensor()  # 转换为张量
+    ]))
+    test_loader = DataLoader(mri, batch_size=batch_size, shuffle=False)
+
+    return test_loader
+
+def merge_labels_and_save(predict_path, output_path):
+    """
+    合并左右标签并保存结果
+
+    :param predict_path: 测试数据集根目录
+    :param output_path: 输出保存路径
+    """
+    original_path = predict_path
+    label_path = original_path.replace('35','35label').replace('original','label')
+
+    # 获取original文件夹中的所有子文件夹
+    folders = os.listdir(original_path)
+
+    # 遍历每个子文件夹
+    for folder in folders:
+        label_folder_path = os.path.join(label_path, folder)
+        left_label_folder = os.path.join(label_folder_path, folder.replace('tal_noscale','L').replace('ACPC','L'))
+        right_label_folder = os.path.join(label_folder_path, folder.replace('tal_noscale','R').replace('ACPC','R'))
+
+        # 检查是否同时存在L和R文件夹
+        if not os.path.exists(left_label_folder) or not os.path.exists(right_label_folder):
+            print(f"Missing L or R folder in {folder}. Skipping folder.")
+            continue
+
+        # 获取原始图像（假设图像是jpg格式）
+        left_labels = sorted([img for img in os.listdir(left_label_folder) if img.endswith('.jpg')])
+        right_labels = sorted([img for img in os.listdir(right_label_folder) if img.endswith('.jpg')])
+
+        # 确保每个文件夹中的图像数量一致
+        if len(left_labels) != len(right_labels):
+            print(f"Image count mismatch in {folder}. Skipping folder.")
+            continue
+
+        # 遍历每个图像
+        for idx in range(len(left_labels)):
+            left_label_path = os.path.join(left_label_folder, left_labels[idx])
+            left_label = cv2.imread(left_label_path, cv2.IMREAD_GRAYSCALE)
+
+            right_label_path = os.path.join(right_label_folder, right_labels[idx])
+            right_label = cv2.imread(right_label_path, cv2.IMREAD_GRAYSCALE)
+
+            # 合并左右标签(值相加）
+            combined_label = cv2.add(left_label, right_label)  # 标签值相加
+
+            # 输出路径
+            output_folder = os.path.join(output_path, '35', folder)
+            os.makedirs(output_folder, exist_ok=True)
+
+            # 保存文件名保持原始文件名结构
+            if(label_folder_path[-4:]=='ACPC'):
+                output_image_name = os.path.basename(left_labels[idx].replace('L','ACPC'))
+            else:
+                output_image_name = os.path.basename(left_labels[idx].replace('L', 'tal_noscale'))
+            output_image_path = os.path.join(output_folder, output_image_name)
+            cv2.imwrite(output_image_path, combined_label)
+
+            # 可视化或调试（可选）
+            # cv2.imshow(f"Combined Image {folder} - {idx}", combined_image)
+            # cv2.waitKey(0)
+
+    # cv2.destroyAllWindows()
+
+def predict(loader, model="model/model.pth", pred_dir="/pred",write=True,device="cpu",threshold = 0.5,record_pred="./model/record_pred.txt"):
+    assert (isinstance(loader, DataLoader))
+    # 初始化网络并加载权重
+    net = UNet(1, 1)
+    net = net.to(device)
+    net.load_state_dict(torch.load(model))
+    net.eval()
+    #预测值归0
+    total_dice = 0
+    total_jaccard = 0
+    total_ppv = 0
+    total_hd95 =0
+    # 预测
+    order = 1
+    create_dir_not_exist(pred_dir)
+    print("目前使用的为：" + str(device))
+    if write:
+        record_pred = open(record_pred, "w")
+    for image, label in loader:
+        tensor_image = image.to(device)
+        pred = net(tensor_image)
+        for i, p ,l in zip(image.detach().numpy(), pred.cpu().detach().numpy(),label.detach().numpy()):
+            # i: [1, w, h], p: [1, w, h]
+            i, p, l = i[0], p[0], l[0]
+            p[p >= threshold] = 1
+            p[p < threshold] = 0
+            # 存储预测结果
+            combined_image = np.hstack((i, p, l))
+            cv2.imwrite("{}/{}.jpg".format(pred_dir, order), combined_image * 255)
+            order += 1
+        # 计算指标
+        np_pred = pred.cpu().detach().numpy()
+        np_label = label.numpy()
+        dice = dice_coef(np_pred, np_label)
+        ppv = ppv_compute(np_pred, np_label)
+        jaccard = jaccard_compute(np_pred, np_label)
+        hd95 = hd95_compute(np_pred, np_label)
+        r = "[order:{}][Dice: {}][jaccard: {}][ppv: {}][hd95: {}]" \
+            .format(order,dice, jaccard, ppv, hd95)
+        print(r)
+        total_dice = total_dice+dice
+        total_ppv = total_ppv+ppv
+        total_jaccard = total_jaccard+jaccard
+        total_hd95 = total_hd95+hd95
+    if write:
+        r = "[Dice: {}][jaccard: {}][ppv: {}][hd95: {}]" \
+            .format(total_dice/order, total_jaccard/order, total_ppv/order, total_hd95/order)
+        record_pred.write(r + "\n")
+
+def main():
+    # Parse command line arguments.
+    parser = argparse.ArgumentParser(description='PyTorch Automatic-segmentation-of-hippocampus predict')
+    parser.add_argument('--base_path', type=str, default='./dataset/MRI_Hippocampus_Segmentation',
+                        help='数据集真值合并预处理输出目录')
+    parser.add_argument('--data_preprocess', default=False,
+                        help='是否进行数据集真值合并预处理(default: True)')
+    parser.add_argument('--output_path', type=str, default='./dataset/MRI_Hippocampus_Segmentation/label_combine_pred',
+                        help='数据集真值合并预处理输出目录')
+    parser.add_argument('--predict_path', type=str, default='./dataset/MRI_Hippocampus_Segmentation/original/35',
+                        help='数据集真值合并预处理输出目录')
+    parser.add_argument('--H', type=int, default=320,
+                        help='resize后图片的高(default: 320)')
+    parser.add_argument('--W', type=int, default=240,
+                        help='resize后图片的宽(default: 240)')
+    parser.add_argument('--batch_size', type=int, default=4,
+                        help='barch_size大小(default:4)')
+    parser.add_argument('--threshold', type=float, default=0.5,
+                        help='阈值threshold大小(default:0.5)，大于此值才判断为海马体区域')
+    parser.add_argument('--cuda', default=True, action='store_true',
+                        help='是否使用GPU加速网络(default: False)')
+    parser.add_argument('--no_display', default=False,
+                        help='是否要展示预测结果图片(default: False).')
+    parser.add_argument('--model_path', type=str, default='./model/train_27900echo.pth',
+                        help='训练完成模型路径')
+    parser.add_argument('--write', action='store_true', default=True,
+                        help='是否要保存预测结果图片(default: True)')
+    parser.add_argument('--write_dir', type=str, default='./output',
+                        help='保存预测结果图片地址(default: ./output).')
+    opt = parser.parse_args()
+    print(opt)
+
+    # 数据预处理
+    if(opt.data_preprocess):
+
+        merge_labels_and_save(opt.predict_path, opt.output_path)
+
+    # 加载数据集
+    test_loader = load_data(opt.base_path,opt.W,opt.H,opt.batch_size)
+
+    if(opt.cuda):
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device("cpu")
+
+    #预测
+    predict(test_loader, opt.model_path,opt.write_dir,opt.write,device,opt.threshold,record_pred="./output/record_pred.txt")
+
+if __name__ == "__main__":
+    main()
