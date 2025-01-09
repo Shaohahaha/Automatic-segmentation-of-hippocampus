@@ -2,6 +2,7 @@ import cv2
 import argparse
 import glob
 import random
+import time
 from torch.utils.data import Dataset,DataLoader
 from torchvision import transforms
 from U_net_tools import *
@@ -111,7 +112,7 @@ def merge_labels_and_save(predict_path, output_path):
 
     # cv2.destroyAllWindows()
 
-def predict(loader, model="model/model.pth", pred_dir="/pred",write=True,device="cpu",threshold = 0.5,record_pred="./model/record_pred.txt"):
+def predict(loader, model="model/model.pth", pred_dir="/pred",write=True,show = True,device="cpu",threshold = 0.5,record_pred="./model/record_pred.txt"):
     assert (isinstance(loader, DataLoader))
     # 初始化网络并加载权重
     net = UNet(1, 1)
@@ -123,42 +124,56 @@ def predict(loader, model="model/model.pth", pred_dir="/pred",write=True,device=
     total_jaccard = 0
     total_ppv = 0
     total_hd95 =0
+    total_time = 0
     # 预测
     order = 1
     create_dir_not_exist(pred_dir)
+    create_dir_not_exist(record_pred)
+    record_pred=record_pred+'/record_pred.txt'
     print("目前使用的为：" + str(device))
-    if write:
-        record_pred = open(record_pred, "w")
+    record_pred = open(record_pred, "a+")
     for image, label in loader:
+        start_time = time.time()
         tensor_image = image.to(device)
         pred = net(tensor_image)
-        for i, p ,l in zip(image.detach().numpy(), pred.cpu().detach().numpy(),label.detach().numpy()):
-            # i: [1, w, h], p: [1, w, h]
-            i, p, l = i[0], p[0], l[0]
-            p[p >= threshold] = 1
-            p[p < threshold] = 0
-            # 存储预测结果
-            combined_image = np.hstack((i, p, l))
-            cv2.imwrite("{}/{}.jpg".format(pred_dir, order), combined_image * 255)
-            order += 1
+        end_time = time.time()
+        elapsed_time_ms = (end_time - start_time) * 1000
+        if write:
+            for i, p ,l in zip(image.detach().numpy(), pred.cpu().detach().numpy(),label.detach().numpy()):
+                # i: [1, w, h], p: [1, w, h]
+                i, p, l = i[0], p[0], l[0]
+                p[p >= threshold] = 1
+                p[p < threshold] = 0
+                # 存储预测结果
+                combined_image = np.hstack((i, p, l))
+                cv2.imwrite("{}/{}.jpg".format(pred_dir, order), combined_image * 255)
+        order += 1
+        # 阈值分割
+        binarized_pred = torch.where(pred < threshold, torch.tensor(0.0, device=pred.device), pred)
+        binarized_pred = torch.where(binarized_pred >= threshold,torch.tensor(1.0, device=binarized_pred.device), binarized_pred)
         # 计算指标
-        np_pred = pred.cpu().detach().numpy()
+        np_pred = binarized_pred.cpu().detach().numpy()
         np_label = label.numpy()
         dice = dice_coef(np_pred, np_label)
         ppv = ppv_compute(np_pred, np_label)
         jaccard = jaccard_compute(np_pred, np_label)
         hd95 = hd95_compute(np_pred, np_label)
-        r = "[order:{}][Dice: {}][jaccard: {}][ppv: {}][hd95: {}]" \
-            .format(order,dice, jaccard, ppv, hd95)
-        print(r)
+        r = "[order:{}][Dice: {}][jaccard: {}][ppv: {}][hd95: {}][time:{}]" \
+                .format(order,dice, jaccard, ppv, hd95,elapsed_time_ms)
+        if show:
+            print(r)
+        record_pred.write(r + "\n")
         total_dice = total_dice+dice
         total_ppv = total_ppv+ppv
         total_jaccard = total_jaccard+jaccard
         total_hd95 = total_hd95+hd95
-    if write:
-        r = "[Dice: {}][jaccard: {}][ppv: {}][hd95: {}]" \
-            .format(total_dice/order, total_jaccard/order, total_ppv/order, total_hd95/order)
-        record_pred.write(r + "\n")
+        total_time = total_time + elapsed_time_ms
+    r = "[Dice: {}][jaccard: {}][ppv: {}][hd95: {}][time:{}]" \
+        .format(total_dice/order, total_jaccard/order, total_ppv/order, total_hd95/order,total_time/order)
+    if show:
+        print(r)
+    record_pred.write(r + "\n")
+    record_pred.close()
 
 def main():
     # Parse command line arguments.
@@ -183,9 +198,11 @@ def main():
                         help='是否使用GPU加速网络(default: False)')
     parser.add_argument('--no_display', default=False,
                         help='是否要展示预测结果图片(default: False).')
-    parser.add_argument('--model_path', type=str, default='./model/train_27900echo.pth',
+    parser.add_argument('--model_path', type=str, default='./model/2025_01_08_22_46_44/train_50000echo.pth',
                         help='训练完成模型路径')
-    parser.add_argument('--write', action='store_true', default=True,
+    parser.add_argument('--ifshow', action='store_true', default=False,
+                        help='是否要print预测指标结果(default: True)')
+    parser.add_argument('--write', action='store_true', default=False,
                         help='是否要保存预测结果图片(default: True)')
     parser.add_argument('--write_dir', type=str, default='./output',
                         help='保存预测结果图片地址(default: ./output).')
@@ -206,7 +223,8 @@ def main():
         device = torch.device("cpu")
 
     #预测
-    predict(test_loader, opt.model_path,opt.write_dir,opt.write,device,opt.threshold,record_pred="./output/record_pred.txt")
+    record_path = opt.write_dir+opt.model_path[34:39]
+    predict(test_loader, opt.model_path,opt.write_dir,opt.write,opt.ifshow,device,opt.threshold,record_pred=record_path)
 
 if __name__ == "__main__":
     main()

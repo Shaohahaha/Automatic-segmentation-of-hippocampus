@@ -2,4 +2,4 @@ dataset/*
 model/*
 .idea
 runs/*
-output/*
+output*/*
