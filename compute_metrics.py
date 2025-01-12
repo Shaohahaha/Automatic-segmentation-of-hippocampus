@@ -117,7 +117,10 @@ def predict(loader, model="model/model.pth", pred_dir="/pred",write=True,show = 
     # 初始化网络并加载权重
     net = UNet(1, 1)
     net = net.to(device)
-    net.load_state_dict(torch.load(model))
+    if str(device)=="cpu":
+        net.load_state_dict(torch.load(model,map_location='cpu'))
+    else:
+        net.load_state_dict(torch.load(model))
     net.eval()
     #预测值归0
     total_dice = 0

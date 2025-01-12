@@ -9,12 +9,17 @@ import nibabel as nib
 import torch
 from torchvision import transforms
 import cv2
+import trimesh
 
+matplotlib.use('TkAgg')  # 强制使用 TkAgg 后端
 # 加载训练好的模型
 def load_model(device = 'cpu',model = './model/pretrained_model.pth'):
     net = UNet(1, 1)
     net = net.to(device)
-    net.load_state_dict(torch.load(model))
+    if str(device) == "cpu":
+        net.load_state_dict(torch.load(model, map_location='cpu'))
+    else:
+        net.load_state_dict(torch.load(model))
     net.eval()
     return net
 
@@ -59,6 +64,7 @@ def create_window():
 
                 messagebox.showinfo("保存成功", f"预测结果已保存：{save_path}")
 
+
     def predict_nii_file(device = 'cpu'):
         file_path = filedialog.askopenfilename(title="选择NIfTI文件", filetypes=[("NIfTI Files", "*.nii;*.nii.gz")])
         if file_path:
@@ -77,27 +83,101 @@ def create_window():
                 # 将预测结果保存到 prediction_stack 对应的切片
                 prediction_stack[x, :,:] = prediction*255.0
             display_3D(prediction_stack)
-            # 将预测结果保存为新的 NIfTI 文件
-            save_path = filedialog.asksaveasfilename(defaultextension=".nii", filetypes=[("NIfTI Files", "*.nii;*.nii.gz")])
-            if save_path:
-                output_nii = nib.Nifti1Image(prediction_stack, nii_img.affine)
-                nib.save(output_nii, save_path)
 
-                messagebox.showinfo("保存成功", f"预测结果已保存：{save_path}")
+            # 在预测完成后，展示保存格式选择按钮
+            show_save_buttons(prediction_stack, nii_img)
+
+    def show_save_buttons(prediction_stack, nii_img):
+        # 创建一个新窗口，显示保存格式的按钮
+        save_window = tk.Toplevel(window)
+        save_window.title("选择保存格式")
+
+        # PLY按钮
+        def save_as_ply():
+            save_ply(prediction_stack)
+            save_window.destroy()  # 关闭保存格式选择窗口
+
+        ply_button = tk.Button(save_window, text="保存为 PLY", command=save_as_ply)
+        ply_button.pack(pady=10)
+
+        # NII按钮
+        def save_as_nii():
+            save_nii(prediction_stack, nii_img)
+            save_window.destroy()  # 关闭保存格式选择窗口
+
+        nii_button = tk.Button(save_window, text="保存为 NII", command=save_as_nii)
+        nii_button.pack(pady=10)
+
+    def save_ply(prediction_stack):
+        save_path = filedialog.asksaveasfilename(defaultextension=".ply", filetypes=[("PLY Files", "*.ply")])
+        if save_path:
+            # 获取非零体素的坐标
+            non_zero_voxels = np.argwhere(prediction_stack > 0)
+            # 创建点云对象
+            point_cloud = trimesh.points.PointCloud(non_zero_voxels)
+            # 保存为 ply 文件
+            point_cloud.export(save_path)
+            messagebox.showinfo("保存成功", f"预测结果已保存为 ply 文件在：{save_path}")
+
+    def save_nii(prediction_stack, nii_img):
+        save_path = filedialog.asksaveasfilename(defaultextension=".nii", filetypes=[("NIfTI Files", "*.nii;*.nii.gz")])
+        if save_path:
+            output_nii = nib.Nifti1Image(prediction_stack, nii_img.affine)
+            nib.save(output_nii, save_path)
+            messagebox.showinfo("保存成功", f"预测结果已保存为 nii 文件在：{save_path}")
 
     def display_image(image, prediction):
+        """
+        在原图上叠加海马体区域，用红色标注。
+
+        :param image: 原始图像 (PIL Image 或 numpy 数组)
+        :param prediction: 海马体区域的预测结果（二值图像）
+        """
         image = Image.fromarray(image.astype(np.uint8))
-        image=image.resize((240, 320), Image.Resampling.LANCZOS)
+        image = image.resize((240, 320), Image.Resampling.LANCZOS)
         matplotlib.rcParams['font.sans-serif'] = ['SimHei']
         matplotlib.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
-        plt.figure()
+
+        # 将原图转换为 numpy 数组，方便后续处理
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+
+        # 确保预测结果是二值化的（海马体区域为1，其它为0）
+        prediction = prediction.astype(np.uint8)
+        # 如果原图是灰度图像，确保其形状是二维的
+        if len(image.shape) == 2:
+            # 对于灰度图像，复制一个 3 通道的图像
+            image_rgb = np.stack([image, image, image], axis=-1)
+        else:
+            # 对于 RGB 图像，直接使用原图
+            image_rgb = image
+
+        # 创建一个 RGB 图像作为红色叠加层
+        overlay = np.zeros_like(image_rgb)
+
+        # 将海马体区域设为黄色
+        overlay[prediction.squeeze(0) == 1] = [255, 255, 0]  # 黄色 (R=255, G=255, B=0)
+
+        # 创建一个透明背景的图像，将原图和黄色叠加层融合
+        output_image = np.copy(image)
+        alpha = 0.5  # 设置叠加的透明度
+        output_image = (1 - alpha) * output_image + alpha * overlay
+
+        # 显示原图与叠加后的图像
+        plt.figure(figsize=(10, 5))
+
+        # 显示原始图像
         plt.subplot(1, 2, 1)
         plt.imshow(image, cmap='gray')
         plt.title("原始图像")
+        plt.axis('off')
 
+        # 显示叠加后的图像
         plt.subplot(1, 2, 2)
-        plt.imshow(prediction.squeeze(), cmap='hot')  # 假设我们预测的是热力图
-        plt.title("预测结果")
+        plt.imshow(output_image.astype(np.uint8))
+        plt.title("叠加海马体区域")
+        plt.axis('off')
+
         plt.show()
 
     def display_3D(images):

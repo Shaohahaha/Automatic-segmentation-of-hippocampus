@@ -4,3 +4,4 @@ model/*
 runs/*
 output*/*
 *.pth
+*.exe

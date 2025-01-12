@@ -3,9 +3,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from scipy.spatial.distance import cdist
-import trimesh
-import nibabel as nib
-import matplotlib.pyplot as plt
 
 class ConvUnit(nn.Module):
     def __init__(self, in_channels, out_channels):
