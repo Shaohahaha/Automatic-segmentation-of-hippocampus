@@ -201,7 +201,7 @@ def main():
                         help='是否使用GPU加速网络(default: False)')
     parser.add_argument('--no_display', default=False,
                         help='是否要展示预测结果图片(default: False).')
-    parser.add_argument('--model_path', type=str, default='./model/2025_01_08_22_46_44/train_50000echo.pth',
+    parser.add_argument('--model_path', type=str, default='./model/2025_01_08_22_46_44/train_40000echo.pth',
                         help='训练完成模型路径')
     parser.add_argument('--ifshow', action='store_true', default=False,
                         help='是否要print预测指标结果(default: True)')

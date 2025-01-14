@@ -2,7 +2,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy.spatial.distance import cdist
+import hausdorff
 
 class ConvUnit(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -112,16 +112,8 @@ def binary_to_point_set(binary_img):
 
 
 
-def hd95_compute(predict: np.ndarray, label: np.ndarray, distance="euclidean"):
-    """
-    计算 HD95 距离
-    :param predict: 预测的二值图像数组 (N, H, W)
-    :param label: 真值的二值图像数组 (N, H, W)
-    :param distance: 距离度量方法
-    :return: 平均 HD95 距离 (整数)
-    """
+def hd95_compute(predict: np.ndarray, label: np.ndarray, method="euclidean"):
     total_hd95 = 0
-    invalid_cases = 0
 
     for i in range(predict.shape[0]):  # 遍历每张图像
         predict_img = predict[i]
@@ -129,26 +121,13 @@ def hd95_compute(predict: np.ndarray, label: np.ndarray, distance="euclidean"):
 
         predict_img, label_img = transform_image_data(predict_img, label_img)
 
-        predict_points = binary_to_point_set(predict_img)
-        label_points = binary_to_point_set(label_img)
+        hddistance = hausdorff.hausdorff_distance(predict_img.squeeze(), label_img.squeeze(), distance=method)
 
-        if predict_points.size == 0 or label_points.size == 0:
-            # 如果任一图像为空集，增加无效计数
-            invalid_cases += 1
-            continue
-
-        # 计算点到点的距离矩阵
-        distances = cdist(predict_points, label_points, metric='euclidean')
-
-        # 计算 HD95 距离
-        hd95 = np.percentile(distances, 95)
+        hd95 = hddistance*0.95
 
         total_hd95 += hd95
 
-    if invalid_cases == predict.shape[0]:
-        return 0
-
-    return int(total_hd95 / (predict.shape[0] - invalid_cases))
+    return total_hd95 / predict.shape[0]
 
 
 def jaccard_compute(predict: np.ndarray, label: np.ndarray):
