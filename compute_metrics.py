@@ -112,10 +112,13 @@ def merge_labels_and_save(predict_path, output_path):
 
     # cv2.destroyAllWindows()
 
-def predict(loader, model="model/model.pth", pred_dir="/pred",write=True,show = True,device="cpu",threshold = 0.5,record_pred="./model/record_pred.txt"):
+def predict(loader, model="model/model.pth",net_type='Unet', pred_dir="/pred",write=True,show = True,device="cpu",threshold = 0.5,record_pred="./model/record_pred.txt"):
     assert (isinstance(loader, DataLoader))
     # 初始化网络并加载权重
-    net = UNet(1, 1)
+    if net_type == 'Unet':
+        net = UNet(1, 1)  # 实例化网络
+    else:
+        net = ResUNet(1, 1)  # 实例化网络
     net = net.to(device)
     if str(device)=="cpu":
         net.load_state_dict(torch.load(model,map_location='cpu'))
@@ -161,11 +164,11 @@ def predict(loader, model="model/model.pth", pred_dir="/pred",write=True,show = 
         ppv = ppv_compute(np_pred, np_label)
         jaccard = jaccard_compute(np_pred, np_label)
         hd95 = hd95_compute(np_pred, np_label)
-        r = "[order:{}][Dice: {}][jaccard: {}][ppv: {}][hd95: {}][time:{}]" \
-                .format(order,dice, jaccard, ppv, hd95,elapsed_time_ms)
-        if show:
-            print(r)
-        record_pred.write(r + "\n")
+        # r = "[order:{}][Dice: {}][jaccard: {}][ppv: {}][hd95: {}][time:{}]" \
+        #         .format(order,dice, jaccard, ppv, hd95,elapsed_time_ms)
+        # if show:
+        #     print(r)
+        # record_pred.write(r + "\n")
         total_dice = total_dice+dice
         total_ppv = total_ppv+ppv
         total_jaccard = total_jaccard+jaccard
@@ -187,6 +190,9 @@ def main():
                         help='是否进行数据集真值合并预处理(default: True)')
     parser.add_argument('--output_path', type=str, default='./dataset/MRI_Hippocampus_Segmentation/label_combine_pred',
                         help='数据集真值合并预处理输出目录')
+    parser.add_argument('--net_type', type=str, default='Unet',
+                        choices=['Unet', 'ResUnet'],
+                        help='网络模型选择 (default: Unet).')
     parser.add_argument('--predict_path', type=str, default='./dataset/MRI_Hippocampus_Segmentation/original/35',
                         help='数据集真值合并预处理输出目录')
     parser.add_argument('--H', type=int, default=320,
@@ -201,9 +207,9 @@ def main():
                         help='是否使用GPU加速网络(default: False)')
     parser.add_argument('--no_display', default=False,
                         help='是否要展示预测结果图片(default: False).')
-    parser.add_argument('--model_path', type=str, default='./model/2025_01_08_22_46_44/train_40000echo.pth',
+    parser.add_argument('--model_path', type=str, default='./model/2025_01_18_19_37_28/train_60000echo.pth',
                         help='训练完成模型路径')
-    parser.add_argument('--ifshow', action='store_true', default=False,
+    parser.add_argument('--ifshow', action='store_true', default=True,
                         help='是否要print预测指标结果(default: True)')
     parser.add_argument('--write', action='store_true', default=False,
                         help='是否要保存预测结果图片(default: True)')
@@ -227,7 +233,7 @@ def main():
 
     #预测
     record_path = opt.write_dir+opt.model_path[34:39]
-    predict(test_loader, opt.model_path,opt.write_dir,opt.write,opt.ifshow,device,opt.threshold,record_pred=record_path)
+    predict(test_loader, opt.model_path,opt.net_type,opt.write_dir,opt.write,opt.ifshow,device,opt.threshold,record_pred=record_path)
 
 if __name__ == "__main__":
     main()

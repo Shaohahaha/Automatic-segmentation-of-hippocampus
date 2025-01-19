@@ -8,6 +8,8 @@ from torchvision import transforms
 from torch.utils.data import Dataset,DataLoader
 from torch.utils.data import random_split
 from U_net_tools import *
+import nibabel as nib
+from PIL import Image
 
 class DiceLoss(nn.Module):
     def __init__(self, epsilon=1e-5):
@@ -20,8 +22,11 @@ class DiceLoss(nn.Module):
         return 1 - (2. * intersection + self.epsilon) / (union + self.epsilon)
 
 class MRIDataset(Dataset):
-    def __init__(self, url, W, H, transform=None):
+    def __init__(self,traindata_aug, url,url1, W, H, transform=None):
         self.label = glob.glob(os.path.join(url, 'label_combine/*/*/*.jpg'))
+        if traindata_aug:
+            self.label+= glob.glob(os.path.join(url1, 'hippocampus_staple/hippocampus_staple/*/*.jpg'))
+            random.shuffle(self.label)
         self.transform = transform
         self.W = W
         self.H = H
@@ -35,7 +40,7 @@ class MRIDataset(Dataset):
     def __getitem__(self, index):
         # 通过索引获取原图和标签的URL
         label_url = self.label[index]
-        img_url = label_url.replace("label_combine","original")
+        img_url = label_url.replace("label_combine","original").replace("hippocampus_staple","Original").replace("_Original","")
         # 通过cv2库读取图像
         image = cv2.imread(img_url)
         label = cv2.imread(label_url)
@@ -64,7 +69,53 @@ class MRIDataset(Dataset):
         return len(self.label)
 
 
-def filter_non_zero_samples(base_path, subject, output_path):
+def nii_to_images(nii_file):
+    # 1. 读取 .nii 文件
+    nii_img = nib.load(nii_file)
+    images = nii_img.get_fdata()  # 获取图像数据
+
+    # 2. 获取 .nii 文件的路径和文件名（不包含扩展名）
+    nii_dir = os.path.dirname(nii_file)
+    nii_name = os.path.splitext(os.path.basename(nii_file))[0]
+
+    # 3. 创建与 .nii 文件名称相同的新文件夹
+    output_dir = os.path.join(nii_dir, nii_name)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # 4. 遍历切片，并保存每一张切片为图片
+    depth, height, width = images.shape
+    for z in range(width):
+        # 获取当前切片
+        slice_data = images[:, :, z]
+
+        # 将切片数据归一化为 0-255 的范围（适用于灰度图像）
+        slice_data_normalized = np.interp(slice_data, (slice_data.min(), slice_data.max()), (0, 255)).astype(np.uint8)
+
+        # 检查图像是否全为255
+        if np.all(slice_data_normalized == 255):
+            continue
+
+        # 将切片数据转换为 PIL 图像
+        slice_img = Image.fromarray(slice_data_normalized)
+
+        # 顺时针旋转 90 度
+        rotated_image = slice_img.rotate(-90, expand=True)
+
+        # 保存图像到新文件夹，格式改为 .jpg
+        slice_filename = os.path.join(output_dir, f"{nii_name}_slice_{z + 1}.jpg")
+        rotated_image.save(slice_filename, 'JPEG', quality=95)
+
+def convert_all_nii_in_folder(folder_path):
+    # 1. 获取文件夹中的所有 .nii 文件
+    nii_files = [f for f in os.listdir(folder_path) if f.endswith('.nii') or f.endswith('.nii.gz')]
+
+    # 2. 对每个 .nii 文件调用 nii_to_images 函数进行处理
+    for nii_file in nii_files:
+        nii_file_path = os.path.join(folder_path, nii_file)
+        nii_to_images(nii_file_path)
+
+def filter_non_zero_samples_AD(base_path, subject, output_path):
     """
     筛选并保存真值不为0的样本
 
@@ -136,34 +187,32 @@ def filter_non_zero_samples(base_path, subject, output_path):
 
     # cv2.destroyAllWindows()
 
-def load_data(url="./dataset", W=240, H=320, batch_size=64, shuffle=True, split=None):
+def load_data(traindata_aug=False,url="./dataset/MRI_Hippocampus_Segmentation",url1='./dataset/calgary_campinas_version', W=240, H=320, batch_size=64, shuffle=True, split=None):
     # 实例化自定义Dataset，加载训练数据集
-    mri = MRIDataset(url, W, H, transform=transforms.Compose([
+    mri = MRIDataset(traindata_aug,url,url1, W, H, transform=transforms.Compose([
         transforms.ToTensor()  # 转换为张量
     ]))
-    # 分割数据集
-    split = split or [0.7, 0.3]
-    n_train = int(split[0] * len(mri))
-    train_set, test_set = random_split(mri, [n_train, len(mri) - n_train])
     # 将数据集封装入DataLoader
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=shuffle)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(mri, batch_size=batch_size, shuffle=shuffle)
 
-    return train_loader, test_loader
+    return train_loader
 
-def train(loader, device="cpu",batch_size=4, lr=1e-3, epochs=10, model="model/",threshold = 0.5):
+def train(loader, net_type,device="cpu",batch_size=4, lr=1e-3, epochs=10, model="model/",threshold = 0.5):
     assert(isinstance(loader, DataLoader))
     current_time = datetime.datetime.now()
     formatted_time = current_time.strftime("%Y_%m_%d_%H_%M_%S")
-    writer = SummaryWriter(log_dir='runs/train_'+formatted_time)
-    net = UNet(1, 1) # 实例化网络
+    writer = SummaryWriter(log_dir='runs/train_'+ str(net_type) +'_'+formatted_time)
+    if net_type == 'Unet':
+        net = UNet(1, 1) # 实例化网络
+    else:
+        net = ResUNet(1, 1)  # 实例化网络
     net = net.to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=lr) # 优化器
     criterion = nn.BCELoss() # 损失函数
     model_savepath = model+'/' + formatted_time + '/'
     create_dir_not_exist(model_savepath)
     record = open(model_savepath+'record.txt', "a")
-    record.write('tringing_'+ formatted_time + "\n")
+    record.write('tringing_'+ net_type +'_' +formatted_time + "\n")
     print("目前使用的为：" + str(device))
     # 开始训练
     train_num = 0
@@ -236,12 +285,21 @@ def train(loader, device="cpu",batch_size=4, lr=1e-3, epochs=10, model="model/",
 def main():
     # Parse command line arguments.
     parser = argparse.ArgumentParser(description='PyTorch Automatic-segmentation-of-hippocampus train.')
-    parser.add_argument('--base_path', type=str, default='./dataset/MRI_Hippocampus_Segmentation',
-                        help='数据集真值合并预处理根目录')
-    parser.add_argument('--output_path', type=str, default='./dataset/MRI_Hippocampus_Segmentation/label_combine',
-                        help='数据集真值合并预处理输出目录')
-    parser.add_argument('--data_preprocess', default=False,
-                        help='是否进行数据集真值合并预处理(default: True)')
+    parser.add_argument('--AD_base_path', type=str, default='./dataset/MRI_Hippocampus_Segmentation',
+                        help='AD患者数据集真值合并预处理根目录')
+    parser.add_argument('--AD_output_path', type=str, default='./dataset/MRI_Hippocampus_Segmentation/label_combine',
+                        help='AD患者数据集真值合并预处理输出目录')
+    parser.add_argument('--C_base_path', type=str, default='./dataset/calgary_campinas_version',
+                        help='正常人数据集预处理根目录')
+    parser.add_argument('--AD_data_preprocess', default=False,
+                        help='是否进行AD患者数据集真值合并预处理(default: True)')
+    parser.add_argument('--C_data_preprocess', default=False,
+                        help='是否进行正常人数据集真值合并预处理(default: False)')
+    parser.add_argument('--traindata_aug', default=True,
+                        help='是否使用正常人数据集和AD数据集进行训练(default: False)')
+    parser.add_argument('--net_type', type=str, default='ResUnet',
+                        choices=['Unet', 'ResUnet'],
+                        help='网络模型选择 (default: Unet).')
     parser.add_argument('--model_path', type=str,
                         default='./model',
                         help='保存预训练模型路径')
@@ -263,24 +321,30 @@ def main():
     print(opt)
 
     # 数据预处理
-    if(opt.data_preprocess):
+    if(opt.AD_data_preprocess):
 
         # 使用100作为训练集
-        filter_non_zero_samples(opt.base_path, '100', opt.output_path)
+        filter_non_zero_samples_AD(opt.AD_base_path, '100', opt.AD_output_path)
 
         # 使用35作为测试集（无需过滤）
         # predict_path = os.path.join(opt.base_path, 'label', '35label')
 
+    if (opt.C_data_preprocess):
+
+        # convert_all_nii_in_folder(opt.C_base_path + '/Original/Original')
+
+        convert_all_nii_in_folder(opt.C_base_path + '/hippocampus_staple/hippocampus_staple')
+
     # 加载数据集
-    train_loader, test_loader = load_data(opt.base_path,opt.W,opt.H,opt.batch_size)
+    train_loader = load_data(opt.traindata_aug,opt.AD_base_path,opt.C_base_path,opt.W,opt.H,opt.batch_size)
 
     if(opt.cuda):
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device("cpu")
 
-    #训练
-    train(train_loader,device,opt.batch_size,opt.lr,opt.epochs,opt.model_path,opt.threshold)
+    # #训练
+    train(train_loader,opt.net_type,device,opt.batch_size,opt.lr,opt.epochs,opt.model_path,opt.threshold)
 
 if __name__ == "__main__":
     main()
