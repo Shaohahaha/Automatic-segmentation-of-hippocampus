@@ -291,13 +291,13 @@ def main():
                         help='AD患者数据集真值合并预处理输出目录')
     parser.add_argument('--C_base_path', type=str, default='./dataset/calgary_campinas_version',
                         help='正常人数据集预处理根目录')
-    parser.add_argument('--AD_data_preprocess', default=False,
-                        help='是否进行AD患者数据集真值合并预处理(default: True)')
-    parser.add_argument('--C_data_preprocess', default=False,
+    parser.add_argument('--AD_data_preprocess', default=False, action='store_true',
+                        help='是否进行AD患者数据集真值合并预处理(default: False)')
+    parser.add_argument('--C_data_preprocess', default=False, action='store_true',
                         help='是否进行正常人数据集真值合并预处理(default: False)')
-    parser.add_argument('--traindata_aug', default=True,
+    parser.add_argument('--traindata_aug', default=False, action='store_true',
                         help='是否使用正常人数据集和AD数据集进行训练(default: False)')
-    parser.add_argument('--net_type', type=str, default='ResUnet',
+    parser.add_argument('--net_type', type=str, default='Unet',
                         choices=['Unet', 'ResUnet'],
                         help='网络模型选择 (default: Unet).')
     parser.add_argument('--model_path', type=str,
@@ -315,7 +315,7 @@ def main():
                         help='epoch大小(default:100)')
     parser.add_argument('--threshold', type=float, default=0.5,
                         help='阈值threshold大小(default:0.5)，大于此值才判断为海马体区域')
-    parser.add_argument('--cuda', default=True, action='store_true',
+    parser.add_argument('--cuda', default=False, action='store_true',
                         help='是否使用GPU加速网络(default: False)')
     opt = parser.parse_args()
     print(opt)

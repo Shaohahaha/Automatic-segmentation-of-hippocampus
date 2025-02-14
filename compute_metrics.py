@@ -41,7 +41,7 @@ class MRIDataset(Dataset):
     def __len__(self):
         return len(self.label)
 
-def load_data(url="./dataset", W=240, H=320, batch_size=4, shuffle=True, split=None):
+def load_data(url="./dataset", W=240, H=320, batch_size=4, shuffle=False, split=None):
     # 实例化自定义Dataset，加载训练数据集
     mri = MRIDataset(url, W, H, transform=transforms.Compose([
         transforms.ToTensor()  # 转换为张量
@@ -133,11 +133,14 @@ def predict(loader, model="model/model.pth",net_type='Unet', pred_dir="/pred",wr
     total_time = 0
     # 预测
     order = 1
+    porder = 1
     create_dir_not_exist(pred_dir)
-    create_dir_not_exist(record_pred)
-    record_pred=record_pred+'/record_pred.txt'
+    create_dir_not_exist(pred_dir+'/'+net_type)
+    pred_dir = pred_dir + '/' + net_type
+    # create_dir_not_exist(record_pred)
+    # record_pred=record_pred+'/record_pred.txt'
     print("目前使用的为：" + str(device))
-    record_pred = open(record_pred, "a+")
+    # record_pred = open(record_pred, "a+")
     for image, label in loader:
         start_time = time.time()
         tensor_image = image.to(device)
@@ -150,9 +153,24 @@ def predict(loader, model="model/model.pth",net_type='Unet', pred_dir="/pred",wr
                 i, p, l = i[0], p[0], l[0]
                 p[p >= threshold] = 1
                 p[p < threshold] = 0
-                # 存储预测结果
-                combined_image = np.hstack((i, p, l))
-                cv2.imwrite("{}/{}.jpg".format(pred_dir, order), combined_image * 255)
+                # 检查是否存在非零区域（即是否有海马体）
+                if np.any(p == 1):  # 如果有海马体区域
+                    # 存储预测结果
+                    output_image = np.zeros((i.shape[0], i.shape[1], 3), dtype=np.uint8)
+
+                    output_image[(p == 1) & (l == 1)] = [0, 255, 0]  # Green
+
+                    output_image[(p == 1) & (l == 0)] = [0, 0, 255]  # Red
+
+                    output_image[(p == 0) & (l   == 1)] = [255, 0, 0]  # Blue
+
+                    output_image[:, :, 0] = np.maximum(output_image[:, :, 0], i)
+
+                    output_image_name = f"pred_{porder}.jpg"
+                    output_image_path = os.path.join(pred_dir, output_image_name)
+
+                    cv2.imwrite(output_image_path, output_image)
+                    porder += 1
         order += 1
         # 阈值分割
         binarized_pred = torch.where(pred < threshold, torch.tensor(0.0, device=pred.device), pred)
@@ -178,16 +196,16 @@ def predict(loader, model="model/model.pth",net_type='Unet', pred_dir="/pred",wr
         .format(total_dice/order, total_jaccard/order, total_ppv/order, total_hd95/order,total_time/order)
     if show:
         print(r)
-    record_pred.write(r + "\n")
-    record_pred.close()
+    # record_pred.write(r + "\n")
+    # record_pred.close()
 
 def main():
     # Parse command line arguments.
     parser = argparse.ArgumentParser(description='PyTorch Automatic-segmentation-of-hippocampus predict')
     parser.add_argument('--base_path', type=str, default='./dataset/MRI_Hippocampus_Segmentation',
                         help='数据集真值合并预处理输出目录')
-    parser.add_argument('--data_preprocess', default=False,
-                        help='是否进行数据集真值合并预处理(default: True)')
+    parser.add_argument('--data_preprocess', default=False, action='store_true',
+                        help='是否进行数据集真值合并预处理(default: False)')
     parser.add_argument('--output_path', type=str, default='./dataset/MRI_Hippocampus_Segmentation/label_combine_pred',
                         help='数据集真值合并预处理输出目录')
     parser.add_argument('--net_type', type=str, default='Unet',
@@ -203,15 +221,13 @@ def main():
                         help='barch_size大小(default:4)')
     parser.add_argument('--threshold', type=float, default=0.5,
                         help='阈值threshold大小(default:0.5)，大于此值才判断为海马体区域')
-    parser.add_argument('--cuda', default=True, action='store_true',
+    parser.add_argument('--cuda', default=False, action='store_true',
                         help='是否使用GPU加速网络(default: False)')
-    parser.add_argument('--no_display', default=False,
-                        help='是否要展示预测结果图片(default: False).')
-    parser.add_argument('--model_path', type=str, default='./model/2025_01_18_19_37_28/train_60000echo.pth',
+    parser.add_argument('--model_path', type=str, default='./model/ResUnet.pth',
                         help='训练完成模型路径')
     parser.add_argument('--ifshow', action='store_true', default=True,
                         help='是否要print预测指标结果(default: True)')
-    parser.add_argument('--write', action='store_true', default=False,
+    parser.add_argument('--write', action='store_true', default=True,
                         help='是否要保存预测结果图片(default: True)')
     parser.add_argument('--write_dir', type=str, default='./output',
                         help='保存预测结果图片地址(default: ./output).')

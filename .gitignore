@@ -1,7 +1,8 @@
 dataset/*
 model/*
+test/*
 .idea
 runs/*
-output*/*
+output*
 *.pth
 *.exe
